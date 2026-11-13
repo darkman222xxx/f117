@@ -1,0 +1,118 @@
+name: Build F-117 private 1g test DLL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out upstream F-117 EFM source
+        uses: actions/checkout@v4
+        with:
+          repository: halfmanbear/HMB-DCS-F-117A-EFM
+          ref: dev
+          path: source
+          persist-credentials: false
+
+      - name: Set up Visual Studio 2022 C++ compiler
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply experimental +1g reference patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patch = @'
+          --- a/EFM Source Code/FlightControls/Pitch.cpp
+          +++ b/EFM Source Code/FlightControls/Pitch.cpp
+          @@ -119,34 +119,45 @@
+                   limit(long_stick_command_with_trim_limited_g - stick_command_pos_filtered, -max_step, max_step);
+ 
+               return stick_command_pos_filtered;
+           }
+ 
+          -// The 1G reference follows gravity's component along the load-factor axis while the stick is
+          -// centred, then feeds gravity forward as the aircraft rolls and pitches.
+          +// Experimental TO 1F-117A-1 page 6-1 behavior: the normal, gear-up pitch-trim
+          +// reference is +1 g independently of roll/pitch attitude. The existing gravity-
+          +// following reference is retained for gear-down and air-refuelling configurations.
+          +// Gravity remains in nz_measured; only the TARGET reference changes here.
+           void update_nz_reference(double stick_command_pos, double gravity_component, double roll_rad, double pitch_rad,
+                                    const Pitch_inputs& in, double dt)
+           {
+          -    if (std::fabs(stick_command_pos) < cfg::nz_stick_deadband)
+          -    {
+          -        const double gravity_error = gravity_component - nz_reference;
+          -        const double track_rate = (gravity_error > 0.0) ? cfg::nz_reference_snap_rate : cfg::nz_reference_track_rate;
+          +    const bool one_g_auto_trim =
+          +        (pitch_mode_gear_down <= cfg::gear_down_threshold) && !pitch_mode_air_refuel_door_open;
+          +    const double reference_target = one_g_auto_trim ? 1.0 : gravity_component;
+          +
+          +    // In 1-g mode always restore the baseline, even with stick displaced. In the
+          +    // other modes preserve the existing neutral-stick gravity tracking behavior.
+          +    if (one_g_auto_trim || std::fabs(stick_command_pos) < cfg::nz_stick_deadband)
+          +    {
+          +        const double reference_error = reference_target - nz_reference;
+          +        const double track_rate = (reference_error > 0.0) ? cfg::nz_reference_snap_rate
+          +                                                          : cfg::nz_reference_track_rate;
+                   const double reference_blend = 1.0 - std::exp(-track_rate * dt);
+          -        nz_reference += gravity_error * reference_blend;
+          -    }
+          -
+          +        nz_reference += reference_error * reference_blend;
+          +    }
+          +
+          +    // Feed-forward of the changing gravity projection is only appropriate in
+          +    // modes that track that projection, NOT in fixed +1-g auto-trim mode.
+          +    if (!one_g_auto_trim)
+               {
+                   const double roll_rate_rad_s = in.roll_rate_deg_s * (pi / 180.0);
+                   const double pitch_rate_rad_s = in.pitch_rate_deg_s * (pi / 180.0);
+                   const double gravity_rate = (-std::sin(roll_rad) * std::cos(pitch_rad) * roll_rate_rad_s) +
+                                               (-std::cos(roll_rad) * std::sin(pitch_rad) * pitch_rate_rad_s);
+                   nz_reference += cfg::gravity_feed_forward_gain * gravity_rate * dt;
+          -        nz_reference = limit(nz_reference, cfg::nz_min, cfg::nz_max);
+          -    }
+          -
+          -    // PAARS commands the load factor; pilot stick still adds on top, and on release
+          -    // the reference continues from the last commanded value.
+          +    }
+          +    nz_reference = limit(nz_reference, cfg::nz_min, cfg::nz_max);
+          +
+          +    // PAARS recovery retains priority over the default reference.
+               if (recovery_nz_active)
+               {
+                   nz_reference = limit(recovery_nz, cfg::nz_min, cfg::nz_max);
+               }
+           }
+          '@
+          # GitHub's Windows checkout may use CRLF. git apply expects the patch
+          # context as LF; normalize just this source file before patching.
+          $pitchPath = Join-Path $PWD 'source/EFM Source Code/FlightControls/Pitch.cpp'
+          $pitchText = [System.IO.File]::ReadAllText($pitchPath)
+          [System.IO.File]::WriteAllText($pitchPath, $pitchText.Replace("`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
+          $patchPath = Join-Path $env:RUNNER_TEMP 'f117-1g.patch'
+          [System.IO.File]::WriteAllText($patchPath, $patch + "`n", [System.Text.UTF8Encoding]::new($false))
+          git -C source apply --check --ignore-space-change "$patchPath"
+          if ($LASTEXITCODE -ne 0) { throw 'Patch does not match upstream dev source; stop rather than producing an unmodified DLL.' }
+          git -C source apply --ignore-space-change "$patchPath"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply experimental patch.' }
+          git -C source diff --stat
+
+      - name: Build Release x64 DLL
+        shell: pwsh
+        working-directory: source/EFM Source Code
+        run: |
+          msbuild F117.sln /p:Configuration=Release /p:Platform=x64 /m
+          if ($LASTEXITCODE -ne 0) { throw 'MSBuild failed.' }
+
+      - name: Upload private DLL for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: F117-experimental-1g-DLL
+          path: source/EFM Source Code/bin/F_117_NightHawk.dll
+          if-no-files-found: error
+          retention-days: 7
